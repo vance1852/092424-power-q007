@@ -117,6 +117,11 @@ class JsonApplication:
             if method == "POST" and path == "/jobs/claim":
                 result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
                 return Response(200, {"job": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "heartbeat":
+                result = self.service.heartbeat_job(
+                    payload["worker_id"], int(parts[1]), int(payload.get("lease_seconds", 60))
+                )
+                return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
                     payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
@@ -126,6 +131,9 @@ class JsonApplication:
                 result = self.service.fail_job(
                     payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
                 )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "abandon":
+                result = self.service.abandon_job(payload["worker_id"], int(parts[1]), payload["error"])
                 return Response(200, result)
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(

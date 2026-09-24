@@ -362,27 +362,100 @@ class TrialService:
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
 
+    def _job(self, job_id: int) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("分析任务不存在")
+        return row
+
     def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+        if not worker_id.strip():
+            raise ValidationFailed("工作进程编号不能为空")
         if lease_seconds <= 0:
             raise ValidationFailed("租约时长必须大于零")
         now = self._now()
         expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
         with transaction(self.connection, immediate=True):
             row = self.connection.execute(
-                "SELECT job_id FROM analysis_jobs WHERE "
+                "SELECT job_id,state,lease_owner,lease_expires_at FROM analysis_jobs WHERE "
                 "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
                 "ORDER BY available_at,job_id LIMIT 1",
                 (now, now),
             ).fetchone()
             if row is None:
                 return None
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? "
-                "WHERE job_id=?",
-                (worker_id, expires, now, row["job_id"]),
+            job_id = row["job_id"]
+            reclaimed_from = None
+            if row["state"] == "leased":
+                # 租约按注入时钟确认已超时：回收时保留失败原因并计入失败次数。
+                reclaimed_from = row["lease_owner"]
+                self.connection.execute(
+                    "UPDATE analysis_jobs SET failures=failures+1,last_error=? WHERE job_id=?",
+                    (f"租约到期未心跳，原持有者 {reclaimed_from} 被回收", job_id),
+                )
+                self._audit(
+                    "analysis_job",
+                    str(job_id),
+                    "analysis.lease_expired",
+                    worker_id,
+                    {
+                        "previous_owner": reclaimed_from,
+                        "lease_expires_at": row["lease_expires_at"],
+                        "reclaimed_by": worker_id,
+                    },
+                )
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,"
+                "updated_at=? WHERE job_id=? AND "
+                "((state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?))",
+                (worker_id, expires, now, job_id, now, now),
             )
-            claimed = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
+            if cursor.rowcount != 1:
+                raise Conflict("分析任务状态已变化，领取冲突")
+            claimed = self._job(job_id)
+            self._audit(
+                "analysis_job",
+                str(job_id),
+                "analysis.claimed",
+                worker_id,
+                {
+                    "batch_id": claimed["batch_id"],
+                    "batch_revision": claimed["batch_revision"],
+                    "attempts": claimed["attempts"],
+                    "lease_expires_at": expires,
+                    "reclaimed_from": reclaimed_from,
+                },
+            )
         return dict(claimed)
+
+    def heartbeat_job(self, worker_id: str, job_id: int, lease_seconds: int = 60) -> dict[str, Any]:
+        if lease_seconds <= 0:
+            raise ValidationFailed("租约时长必须大于零")
+        job = self._job(job_id)
+        now = self._now()
+        if job["state"] != "leased" or job["lease_owner"] != worker_id:
+            raise InvalidState("任务未由当前工作进程持有")
+        if job["lease_expires_at"] <= now:
+            raise InvalidState("任务租约已经过期，无法心跳续租")
+        expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET lease_expires_at=?,updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_expires_at>?",
+                (expires, now, job_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("任务租约已变化，心跳失败")
+            self._audit(
+                "analysis_job",
+                str(job_id),
+                "analysis.heartbeat",
+                worker_id,
+                {"lease_expires_at": expires},
+            )
+        return {"job_id": job_id, "state": "leased", "lease_expires_at": expires}
 
     def _analysis_observations(self, batch_id: str, protocol: Protocol) -> tuple[Observation, ...]:
         rows = self.connection.execute(
@@ -409,9 +482,11 @@ class TrialService:
 
     def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
         self._require(statistician_id, "analysis.run")
-        job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
-        if job is None:
-            raise NotFound("分析任务不存在")
+        job = self._job(job_id)
+        if job["state"] == "succeeded":
+            raise InvalidState("任务已完成，同一输入不能重复执行")
+        if job["state"] == "failed":
+            raise InvalidState("任务已放弃，同一输入不能再次执行")
         if job["state"] != "leased" or job["lease_owner"] != worker_id:
             raise InvalidState("任务未由当前工作进程持有")
         if job["lease_expires_at"] <= self._now():
@@ -432,13 +507,21 @@ class TrialService:
         input_digest = content_digest(snapshot_rows)
         result = analyze(protocol, observations)
         with transaction(self.connection, immediate=True):
+            now = self._now()
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_expires_at>?",
+                (now, job_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("任务租约已变化，完成请求被拒绝")
             existing = self.connection.execute(
                 "SELECT analysis_id,result_json FROM analyses WHERE batch_id=? AND batch_revision=? AND input_sha256=?",
                 (batch["batch_id"], job["batch_revision"], input_digest),
             ).fetchone()
             if existing is None:
                 cursor = self.connection.execute(
-                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed," 
+                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed,"
                     "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         batch["batch_id"], job["batch_revision"], protocol_digest, input_digest,
@@ -449,11 +532,6 @@ class TrialService:
             else:
                 analysis_id = existing["analysis_id"]
                 result = json.loads(existing["result_json"])
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,updated_at=? "
-                "WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (self._now(), job_id, worker_id),
-            )
             self.connection.execute(
                 "UPDATE batches SET state='analyzed' WHERE batch_id=? AND state IN ('sealed','analyzing')",
                 (batch["batch_id"],),
@@ -468,16 +546,54 @@ class TrialService:
         return {"analysis_id": analysis_id, "input_sha256": input_digest, "result": result}
 
     def fail_job(self, worker_id: str, job_id: int, error: str, retry_seconds: int = 0) -> dict[str, Any]:
+        if not error.strip():
+            raise ValidationFailed("失败原因不能为空")
+        if retry_seconds < 0:
+            raise ValidationFailed("重试延迟不能为负")
         available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
-                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL," 
-                "last_error=?,updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=?",
+                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL,"
+                "failures=failures+1,last_error=?,updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=?",
                 (available, error[:1000], self._now(), job_id, worker_id),
             )
             if cursor.rowcount != 1:
                 raise InvalidState("任务未由当前工作进程持有")
-        return {"job_id": job_id, "state": "queued", "available_at": available}
+            failures = self._job(job_id)["failures"]
+            self._audit(
+                "analysis_job",
+                str(job_id),
+                "analysis.failed",
+                worker_id,
+                {
+                    "error": error[:1000],
+                    "retry_seconds": retry_seconds,
+                    "available_at": available,
+                    "failures": failures,
+                },
+            )
+        return {"job_id": job_id, "state": "queued", "available_at": available, "failures": failures}
+
+    def abandon_job(self, worker_id: str, job_id: int, error: str) -> dict[str, Any]:
+        if not error.strip():
+            raise ValidationFailed("放弃原因不能为空")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='failed',lease_owner=NULL,lease_expires_at=NULL,"
+                "failures=failures+1,last_error=?,updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=?",
+                (error[:1000], self._now(), job_id, worker_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("任务未由当前工作进程持有")
+            failures = self._job(job_id)["failures"]
+            self._audit(
+                "analysis_job",
+                str(job_id),
+                "analysis.abandoned",
+                worker_id,
+                {"error": error[:1000], "failures": failures},
+            )
+        return {"job_id": job_id, "state": "failed", "failures": failures}
 
     def decide(
         self, actor_id: str, batch_id: str, analysis_id: int, decision: str, reason: str

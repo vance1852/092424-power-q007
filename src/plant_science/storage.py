@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     batch_revision INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    failures INTEGER NOT NULL DEFAULT 0 CHECK (failures >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at TEXT,
@@ -190,11 +191,23 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate_analysis_jobs(connection: sqlite3.Connection) -> None:
+    """为旧版本数据库补齐 analysis_jobs 的失败计数字段。"""
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(analysis_jobs)")}
+    if "failures" not in columns:
+        connection.execute(
+            "ALTER TABLE analysis_jobs ADD COLUMN failures "
+            "INTEGER NOT NULL DEFAULT 0 CHECK (failures >= 0)"
+        )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        _migrate_analysis_jobs(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
