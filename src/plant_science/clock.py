@@ -25,6 +25,8 @@ class FrozenClock:
 
 
 def isoformat(value: datetime) -> str:
+    """输出固定宽度的 UTC 文本，保证租约时间可以按字符串安全比较。"""
+
     if value.tzinfo is None:
         raise ValueError("时间必须带时区")
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
